@@ -1,9 +1,15 @@
 import asyncio
+import os
+import sys
 import tempfile
 import unittest
 from argparse import Namespace
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
+
+# 隔离数据目录(防止 CLI 导入链触达真实数据库, 见 test_account_meta.py 顶部说明)
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+os.environ["MPAU_DATA_DIR"] = tempfile.mkdtemp(prefix="mpau-test-")
 
 import mpau_cli
 
@@ -243,6 +249,8 @@ class SauCliDispatchTests(unittest.TestCase):
             tags="tag1,tag2",
             schedule=0,
             thumbnail=Path("cover.png"),
+            debug=False,
+            headless=True,
         )
         with patch("mpau_cli.upload_tiktok_video", new=AsyncMock()) as mock_upload:
             asyncio.run(mpau_cli.dispatch(args))
@@ -250,6 +258,53 @@ class SauCliDispatchTests(unittest.TestCase):
         request = mock_upload.await_args.args[0]
         self.assertEqual(request.tags, ["tag1", "tag2"])
         self.assertEqual(request.thumbnail_file, Path("cover.png"))
+        # 批量调度走 --headless, 必须能透传到 uploader(此前被硬编码丢弃)
+        self.assertTrue(request.headless)
+
+    def test_tiktok_upload_video_accepts_runtime_flags(self):
+        """回归: 批量调度会追加 --headed/--headless, tiktok 子命令缺这两个参数会 argparse 报错。"""
+        parser = mpau_cli.build_parser()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            video_path = Path(tmp_dir) / "demo.mp4"
+            video_path.write_bytes(b"video")
+            base = ["tiktok", "upload-video", "--account", "c1", "--file", str(video_path), "--title", "t"]
+            headless_args = parser.parse_args(base + ["--headless"])
+            headed_args = parser.parse_args(base + ["--headed"])
+        self.assertTrue(headless_args.headless)
+        self.assertFalse(headed_args.headless)
+
+    def test_kuaishou_upload_video_accepts_goods_name(self):
+        """快手挂车按商品名称(真机校准: 只支持名称搜索, 无商品ID)。"""
+        parser = mpau_cli.build_parser()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            video_path = Path(tmp_dir) / "demo.mp4"
+            video_path.write_bytes(b"video")
+            args = parser.parse_args([
+                "kuaishou", "upload-video", "--account", "k1", "--file", str(video_path),
+                "--title", "标题", "--goods-name", "左烘右焙新鲜椰蓉面包椰香浓郁营养早餐80g*9包",
+                "--headed",
+            ])
+        self.assertEqual(args.goods_name, "左烘右焙新鲜椰蓉面包椰香浓郁营养早餐80g*9包")
+
+    def test_dispatch_kuaishou_passes_goods_name(self):
+        args = Namespace(
+            platform="kuaishou",
+            action="upload-video",
+            account="creator",
+            file=Path("demo.mp4"),
+            title="视频标题",
+            desc="视频简介",
+            tags="测试",
+            schedule=0,
+            thumbnail=None,
+            goods_name="左烘右焙新鲜椰蓉面包椰香浓郁营养早餐80g*9包",
+            debug=False,
+            headless=True,
+        )
+        with patch("mpau_cli.upload_kuaishou_video", new=AsyncMock()) as mock_upload:
+            asyncio.run(mpau_cli.dispatch(args))
+        request = mock_upload.await_args.args[0]
+        self.assertEqual(request.goods_name, "左烘右焙新鲜椰蓉面包椰香浓郁营养早餐80g*9包")
 
     def test_dispatch_baijiahao_upload_video_builds_request(self):
         args = Namespace(

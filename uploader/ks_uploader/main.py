@@ -11,7 +11,7 @@ from patchright.async_api import Page
 from patchright.async_api import Playwright
 from patchright.async_api import async_playwright
 
-from utils.config import DEBUG_MODE, LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
+from utils.config import DEBUG_MODE, LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH, MPAU_HOME
 from uploader.base_video import BaseVideoUploader
 from utils.base_social_media import set_init_script
 from utils.files_times import get_absolute_path
@@ -188,6 +188,28 @@ async def ks_setup(account_file, handle=False, return_detail=False, qrcode_callb
     return result if return_detail else True
 
 
+async def _extract_ks_nickname(page: Page) -> str:
+    """快手创作者平台顶栏 .user-info-name 抓真实昵称; 抓不到返回空串。"""
+    try:
+        loc = page.locator("div.user-info-name").first
+        if await loc.count() and await loc.is_visible():
+            return (await loc.inner_text()).strip()
+        return ""
+    except Exception:
+        return ""
+
+
+async def fetch_account_nickname(account_file) -> str:
+    """独立抓取快手创作者平台真实昵称并写入账号元数据(供 `mpau kuaishou nickname` 与 Web 登录回填)。
+
+    与登录子进程解耦: 网页端「完成登录」会 taskkill 登录进程, 那里尾部的抓取可能来不及执行。
+    失败返回空串, 不影响登录状态。
+    """
+    from utils.nickname import capture_nickname
+
+    return await capture_nickname("kuaishou", str(account_file), "https://cp.kuaishou.com/profile", _extract_ks_nickname)
+
+
 async def get_ks_cookie(
     account_file,
     qrcode_callback=None,
@@ -222,6 +244,21 @@ async def get_ks_cookie(
                     if await cookie_auth(account_file):
                         kuaishou_logger.success(_msg("🥳", "快手扫码登录成功，小人开心收工"))
                         result = _build_login_result(True, "success", "快手扫码登录成功", account_file, qrcode_info, page.url)
+                        # 抓取真实昵称用于账号列表展示(失败不影响登录结果)
+                        try:
+                            from pipeline.account_meta import set_nickname
+
+                            nickname = await _extract_ks_nickname(page)
+                            if not nickname:
+                                await page.goto("https://cp.kuaishou.com/profile", timeout=30000, wait_until="domcontentloaded")
+                                await page.wait_for_timeout(3000)
+                                nickname = await _extract_ks_nickname(page)
+                            if nickname:
+                                set_nickname("kuaishou", Path(account_file).stem, nickname)
+                                kuaishou_logger.info(_msg("👤", f"已记录平台昵称: {nickname}"))
+                                print(f"[PROFILE] platform=kuaishou account={Path(account_file).stem} nickname={nickname}", flush=True)
+                        except Exception:
+                            pass
                     else:
                         kuaishou_logger.error(_msg("😢", "快手扫码完成了，但 cookie 校验失败"))
                         result = _build_login_result(
@@ -385,6 +422,7 @@ class KSVideo(KSBaseUploader):
         headless: bool = LOCAL_CHROME_HEADLESS,
         thumbnail_path=None,
         desc: str | None = None,
+        goods_name: str | None = None,
     ):
         super().__init__(
             publish_date=publish_date,
@@ -398,6 +436,8 @@ class KSVideo(KSBaseUploader):
         self.tags = tags or []
         self.thumbnail_path = thumbnail_path
         self.desc = desc or ""
+        # 快手只支持按**商品名称**关联商品(不支持商品ID), 名称需与快手小店里一致
+        self.goods_name = str(goods_name).strip() if goods_name else ""
 
     async def validate_upload_args(self):
         await self.validate_base_args()
@@ -406,6 +446,8 @@ class KSVideo(KSBaseUploader):
         self.file_path = str(self.validate_video_file(self.file_path))
         if self.thumbnail_path:
             self.thumbnail_path = str(self.validate_image_file(self.thumbnail_path))
+        if self.goods_name and not str(self.goods_name).strip():
+            raise ValueError("快手商品名称不能为空白")
 
     async def handle_upload_error(self, page: Page):
         kuaishou_logger.warning(_msg("😵", "视频上传摔了一跤，小人马上重新上传"))
@@ -439,6 +481,198 @@ class KSVideo(KSBaseUploader):
 
         await modal.wait_for(state="hidden", timeout=30000)
         kuaishou_logger.success(_msg("🥳", "封面已经设置完成"))
+
+    async def _add_goods(self, page: Page) -> None:
+        """挂载快手商品 —— 走「作者服务 → 关联商品」, 按**商品名称**搜索并关联。
+
+        真机校准结论(2026-09-11, 账号 百悦食品专营店):
+          - 入口: 「作者服务」行第一个 ant-select, 默认值「选择服务类型」
+          - 选项: 关联商品 / 关联推广任务 / 关联小程序 / 招聘人才
+          - 选中「关联商品」后, 该行右侧出现商品搜索框(占位「关联商品获得更多收入」)
+          - 输入商品名后结果是 antd 选项(.ant-select-item-option), 内容形如「商品名￥19.99」
+          - 候选项文本里带商品 JSON({"title":...,"url":...}), 优先用它精确匹配名称
+        注意: 必须先 close_guide_overlay —— Joyride 遮罩会拦截所有点击。
+
+        任一步失败即截图并抛异常中断, 绝不静默发布一条没挂上商品的视频。
+        """
+        if not self.goods_name:
+            return
+        goods_name = str(self.goods_name).strip()
+        kuaishou_logger.info(_msg("🛍️", f"小人准备关联商品: {goods_name}"))
+
+        async def _fail(reason: str) -> None:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            shot_dir = Path(MPAU_HOME) / "logs"
+            shot_dir.mkdir(parents=True, exist_ok=True)
+            shot = str(shot_dir / f"ks_goods_{ts}.png")
+            try:
+                await page.screenshot(path=shot, full_page=True)
+            except Exception:  # noqa: BLE001
+                shot = "(截图失败)"
+            kuaishou_logger.error(_msg("❌", f"{reason} 截图: {shot}"))
+            raise RuntimeError(f"快手商品关联失败: {reason} 截图: {shot}")
+
+        # 步骤 1: 滚动到底(该区块在页面底部, 不滚动则未渲染)
+        for _ in range(6):
+            await page.mouse.wheel(0, 1200)
+            await asyncio.sleep(0.3)
+        await page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+        await asyncio.sleep(1)
+
+        # 步骤 2: 关 Joyride 引导遮罩(否则点击全被拦截)
+        try:
+            await self.close_guide_overlay(page)
+        except Exception as exc:  # noqa: BLE001
+            kuaishou_logger.warning(_msg("😵", f"关引导遮罩异常, 继续: {exc}"))
+        removed = await page.evaluate(
+            "() => { let n=0; document.querySelectorAll('#react-joyride-portal')"
+            ".forEach(e => { e.remove(); n++; }); return n; }"
+        )
+        if removed:
+            kuaishou_logger.info(_msg("🧹", f"已移除引导遮罩节点 x{removed}"))
+            await asyncio.sleep(0.5)
+
+        # 步骤 3: 定位「作者服务」行(按坐标, 规避哈希类名), 点开服务类型下拉
+        located = await page.evaluate("""() => {
+            const vis = el => { const r = el.getBoundingClientRect();
+                if (!r.width || !r.height) return false;
+                const st = getComputedStyle(el);
+                return st.visibility !== 'hidden' && st.display !== 'none'; };
+            const labels = [...document.querySelectorAll('label,div,span')]
+                .filter(el => (el.textContent || '').trim() === '作者服务' && vis(el));
+            if (!labels.length) return {ok: false, err: '未找到「作者服务」字段'};
+            const lb = labels[0].getBoundingClientRect();
+            const sels = [...document.querySelectorAll('.ant-select')].filter(el => {
+                const r = el.getBoundingClientRect();
+                return r.width > 0 && Math.abs(r.y - lb.y) < 20 && r.x > lb.x;
+            });
+            if (!sels.length) return {ok: false, err: '「作者服务」行未找到下拉框'};
+            sels[0].setAttribute('data-mpau', 'svc');
+            if (sels.length > 1) sels[1].setAttribute('data-mpau', 'goodsbox');
+            return {ok: true, row_text: (sels[0].textContent || '').trim().slice(0, 24)};
+        }""")
+        if not located.get("ok"):
+            await _fail(f"未找到「作者服务 → 关联商品」入口({located.get('err')})。"
+                        f"该账号可能未开通商品分享权限")
+        kuaishou_logger.info(_msg("🔎", f"作者服务当前值: {located.get('row_text')}"))
+
+        try:
+            await page.locator('[data-mpau="svc"]').first.click(timeout=8000)
+        except Exception:  # noqa: BLE001
+            # 遮罩/遮挡兜底: 直接派发鼠标事件
+            await page.locator('[data-mpau="svc"]').first.evaluate("""el => {
+                for (const t of ['mousedown','mouseup','click'])
+                    el.dispatchEvent(new MouseEvent(t, {bubbles:true, cancelable:true, view:window}));
+            }""")
+        await asyncio.sleep(1.5)
+
+        # 步骤 4: 选「关联商品」(JS 点选更稳, 绕开 hit-testing)
+        try:
+            await page.wait_for_selector(
+                ".ant-select-dropdown:not(.ant-select-dropdown-hidden)", timeout=8000
+            )
+        except Exception:  # noqa: BLE001
+            kuaishou_logger.warning(_msg("😵", "等待服务类型下拉超时, 仍尝试点选"))
+        picked = await page.evaluate("""() => {
+            const dds = [...document.querySelectorAll('.ant-select-dropdown')]
+                .filter(d => !d.className.includes('hidden'));
+            for (const dd of dds) {
+                for (const it of dd.querySelectorAll('.ant-select-item-option,[role="option"]')) {
+                    if ((it.textContent || '').trim() === '关联商品') {
+                        it.scrollIntoView({block: 'center'});
+                        it.dispatchEvent(new MouseEvent('mousedown', {bubbles:true, cancelable:true, view:window}));
+                        it.dispatchEvent(new MouseEvent('mouseup', {bubbles:true, cancelable:true, view:window}));
+                        it.click();
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }""")
+        if not picked:
+            # 兜底: Playwright 点击
+            try:
+                await page.locator(
+                    '.ant-select-dropdown:not(.ant-select-dropdown-hidden) .ant-select-item-option'
+                ).filter(has_text="关联商品").first.click(timeout=8000)
+                picked = True
+            except Exception as exc:  # noqa: BLE001
+                await _fail(f"未能选中「关联商品」选项({exc})")
+        await asyncio.sleep(2)
+
+        # 断言服务类型已切换, 且商品框已启用
+        state = await page.evaluate("""() => {
+            const labels = [...document.querySelectorAll('label,div,span')]
+                .filter(el => (el.textContent || '').trim() === '作者服务');
+            if (!labels.length) return {err: 'no-label'};
+            const lb = labels[0].getBoundingClientRect();
+            const sels = [...document.querySelectorAll('.ant-select')].filter(el => {
+                const r = el.getBoundingClientRect();
+                return r.width > 0 && Math.abs(r.y - lb.y) < 20 && r.x > lb.x;
+            });
+            return {row_texts: sels.map(s => (s.textContent || '').trim().slice(0, 24)),
+                    disabled: sels.map(s => s.className.includes('disabled'))};
+        }""")
+        texts = state.get("row_texts") or []
+        if not texts or "关联商品" not in texts[0]:
+            await _fail(f"服务类型未切换为「关联商品」(当前: {texts})")
+        if len(texts) > 1 and "收入" not in texts[1]:
+            await _fail(f"商品搜索框未出现(当前行: {texts})")
+        if state.get("disabled") and state["disabled"][-1]:
+            await _fail("商品搜索框处于禁用状态")
+        kuaishou_logger.info(_msg("✅", "已选中「关联商品」, 商品搜索框已就绪"))
+
+        # 步骤 5: 输入商品名称并等待结果
+        search = page.locator('[data-mpau="goodsbox"] input').first
+        try:
+            await search.click(timeout=8000)
+        except Exception:  # noqa: BLE001
+            pass
+        await asyncio.sleep(1)
+        try:
+            await search.fill("")
+            await search.type(goods_name, delay=40)
+        except Exception as exc:  # noqa: BLE001
+            await _fail(f"商品名称输入失败({exc})")
+        await asyncio.sleep(4)
+
+        # 步骤 6: 匹配并点选商品(优先用候选项里的商品 JSON 精确比对)
+        chosen = await page.evaluate("""(want) => {
+            const dds = [...document.querySelectorAll('.ant-select-dropdown')]
+                .filter(d => !d.className.includes('hidden'));
+            const opts = [];
+            for (const dd of dds) {
+                for (const it of dd.querySelectorAll('.ant-select-item-option,[role="option"]')) {
+                    const txt = (it.textContent || '').trim();
+                    if (!txt || !(txt.includes('￥') || txt.includes('¥'))) continue;
+                    opts.push(it);
+                }
+            }
+            if (!opts.length) return {found: false, reason: 'no-option'};
+            const meta = el => {
+                const m = (el.textContent || '').match(/\\{[^{}]*"title"\\s*:\\s*"([^"]+)"/);
+                return m ? m[1] : '';
+            };
+            const norm = s => (s || '').replace(/\\s+/g, '').toLowerCase();
+            const target = norm(want);
+            let hit = opts.find(o => norm(meta(o)) === target);
+            if (!hit) hit = opts.find(o => norm(meta(o)).includes(target));
+            if (!hit) hit = opts.find(o => norm(o.textContent).includes(target));
+            if (!hit) return {found: false, reason: 'no-match', count: opts.length};
+            hit.scrollIntoView({block: 'center'});
+            hit.dispatchEvent(new MouseEvent('mousedown', {bubbles:true, cancelable:true, view:window}));
+            hit.dispatchEvent(new MouseEvent('mouseup', {bubbles:true, cancelable:true, view:window}));
+            hit.click();
+            return {found: true, picked: meta(hit) || (hit.textContent || '').trim().slice(0, 60),
+                    count: opts.length};
+        }""", goods_name)
+
+        if not chosen.get("found"):
+            detail = "搜索结果为空" if chosen.get("reason") == "no-option" else \
+                     f"搜索结果里没有匹配「{goods_name}」的商品(共 {chosen.get('count')} 条)"
+            await _fail(f"{detail}。请确认商品名称与快手小店里完全一致")
+        await asyncio.sleep(2)
+        kuaishou_logger.success(_msg("🛍️", f"已关联商品: {chosen.get('picked')}"))
 
     async def upload(self, playwright: Playwright) -> None:
         kuaishou_logger.info(_msg("🧍", "小人先检查 cookie、视频文件、封面和发布时间"))
@@ -523,6 +757,9 @@ class KSVideo(KSBaseUploader):
                 kuaishou_logger.warning(_msg("😵", "超过最大重试次数，视频上传可能未完成"))
 
             await self.set_thumbnail(page)
+
+            # 挂车: 上传完成后、发布前关联商品(失败会抛异常中断, 不静默发无商品视频)
+            await self._add_goods(page)
 
             if self.publish_strategy == KUAISHOU_PUBLISH_STRATEGY_SCHEDULED and self.publish_date != 0:
                 await self.set_schedule_time(page, self.publish_date)

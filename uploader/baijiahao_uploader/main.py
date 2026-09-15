@@ -2,7 +2,7 @@
 import random
 from datetime import datetime
 
-from playwright.async_api import Playwright, async_playwright, Page
+from patchright.async_api import Playwright, async_playwright, Page
 import os
 import time
 import asyncio
@@ -61,6 +61,42 @@ async def baijiahao_setup(account_file, handle=False):
         baijiahao_logger.error("cookie文件不存在或已失效，即将自动打开浏览器，请扫码登录，登陆后会自动生成cookie文件")
         await baijiahao_cookie_gen(account_file)
     return True
+
+
+async def _extract_bjh_nickname(page: Page) -> str:
+    """百家号创作后台顶栏用户区抓真实昵称(候选选择器兜底); 抓不到返回空串。"""
+    try:
+        for selector in (
+            "div.user-name",
+            "div[class*='user-name']",
+            "span[class*='nick-name']",
+            "div[class*='header'] [class*='name']",
+        ):
+            loc = page.locator(selector).first
+            if await loc.count() and await loc.is_visible():
+                text = (await loc.inner_text()).strip()
+                if text and len(text) <= 24:
+                    return text
+        return ""
+    except Exception:
+        return ""
+
+
+async def fetch_account_nickname(account_file) -> str:
+    """独立抓取百家号真实昵称并写入账号元数据(供 `mpau baijiahao nickname` 与 Web 登录回填)。
+
+    与登录子进程解耦: 网页端「完成登录」会 taskkill 登录进程, 那里尾部的抓取可能来不及执行。
+    失败返回空串, 不影响登录状态。
+    """
+    from utils.nickname import capture_nickname
+
+    return await capture_nickname(
+        "baijiahao",
+        str(account_file),
+        "https://baijiahao.baidu.com/builder/rc/home",
+        _extract_bjh_nickname,
+    )
+
 
 class BaiJiaHaoVideo(object):
     def __init__(self, title, file_path, tags, publish_date: datetime, account_file, proxy_setting=None):

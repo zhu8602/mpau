@@ -1,5 +1,28 @@
 # Installation
 
+## Windows installer (end users, no Python required)
+
+Download `mpau-setup-<version>.exe` and run it. The installer:
+
+- installs to `%LOCALAPPDATA%\Programs\mpau` (no admin rights needed)
+- bundles the Python runtime and all browser drivers (patchright + playwright) — zero prerequisites
+- extracts browser drivers to `%LOCALAPPDATA%\ms-playwright`
+- stores runtime data (cookies, database, logs) in `%LOCALAPPDATA%\mpau-data` (override with `MPAU_HOME`)
+- offers a desktop shortcut and optional auto-start on login; launches the app and opens the browser right after install
+
+Browser resolution order: `MPAU_CHROME_PATH` > system Chrome > bundled Chromium, so machines without Chrome still work.
+
+The installer is not code-signed; Windows SmartScreen will warn — choose "Run anyway".
+
+### Building the installer
+
+```bash
+uv run python tools/build_installer.py                            # full build
+uv run python tools/build_installer.py --skip-pip --skip-kernels  # incremental rebuild
+```
+
+Output: `package/dist/mpau-setup-<version>.exe`. Portable Inno Setup is fetched automatically on first build (`MPAU_INNO_URL` overrides the download mirror, `MPAU_ISCC` points at an existing ISCC.exe).
+
 ## Requirements
 
 - Python `>=3.10,<3.13`

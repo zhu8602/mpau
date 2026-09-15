@@ -1,5 +1,3 @@
-from pathlib import Path
+from utils.config import COOKIES_DIR
 
-from utils.config import BASE_DIR
-
-Path(BASE_DIR / "cookies" / "tk_uploader").mkdir(exist_ok=True)
+(COOKIES_DIR / "tk_uploader").mkdir(exist_ok=True)

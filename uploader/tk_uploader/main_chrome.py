@@ -2,7 +2,7 @@
 import re
 from datetime import datetime
 
-from playwright.async_api import Playwright, async_playwright
+from patchright.async_api import Playwright, async_playwright
 import os
 import asyncio
 
@@ -15,7 +15,15 @@ from utils.log import tiktok_logger
 
 async def cookie_auth(account_file):
     async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(headless=LOCAL_CHROME_HEADLESS)
+        # 与全仓一致的三级浏览器策略: 显式路径 > 系统 Chrome(channel) > 内置内核
+        if LOCAL_CHROME_PATH:
+            browser = await playwright.chromium.launch(
+                headless=LOCAL_CHROME_HEADLESS, executable_path=LOCAL_CHROME_PATH
+            )
+        else:
+            browser = await playwright.chromium.launch(
+                headless=LOCAL_CHROME_HEADLESS, channel="chrome"
+            )
         context = await browser.new_context(storage_state=account_file)
         context = await set_init_script(context)
         # 创建一个新的页面
@@ -57,6 +65,11 @@ async def get_tiktok_cookie(account_file):
             ],
             'headless': LOCAL_CHROME_HEADLESS,  # Set headless option here
         }
+        # 浏览器选择与 cookie_auth/upload 保持一致
+        if LOCAL_CHROME_PATH:
+            options['executable_path'] = LOCAL_CHROME_PATH
+        else:
+            options['channel'] = 'chrome'
         # Make sure to run headed.
         browser = await playwright.chromium.launch(**options)
         # Setup context however you like.
@@ -70,8 +83,43 @@ async def get_tiktok_cookie(account_file):
         await context.storage_state(path=account_file)
 
 
+async def _extract_tk_nickname(page) -> str:
+    """TikTok Studio 顶栏用户区抓真实昵称; 抓不到返回空串。"""
+    selectors = (
+        '[data-e2e="studio-username"]',
+        'div[class*="UserInfo"] [class*="UserName"]',
+        'span[class*="UserName"]',
+        '[class*="Avatar"] [class*="Nickname"]',
+    )
+    try:
+        for selector in selectors:
+            loc = page.locator(selector).first
+            try:
+                if await loc.count() and await loc.is_visible():
+                    text = (await loc.inner_text()).strip()
+                    if text and len(text) <= 24:
+                        return text
+            except Exception:
+                continue
+        return ""
+    except Exception:
+        return ""
+
+
+async def fetch_account_nickname(account_file) -> str:
+    """独立抓取 TikTok 真实昵称并写入账号元数据(供 `mpau tiktok nickname` 与 Web 登录回填)。
+
+    与登录子进程解耦: 网页端「完成登录」会 taskkill 登录进程, 那里尾部的抓取可能来不及执行。
+    失败返回空串, 不影响登录状态。
+    """
+    from utils.nickname import capture_nickname
+
+    return await capture_nickname("tiktok", str(account_file), "https://www.tiktok.com/tiktokstudio/upload", _extract_tk_nickname)
+
+
 class TiktokVideo(object):
-    def __init__(self, title, file_path, tags, publish_date, account_file, thumbnail_path=None):
+    def __init__(self, title, file_path, tags, publish_date, account_file,
+                 thumbnail_path=None, debug: bool = False, headless: bool | None = None):
         self.title = title
         self.file_path = file_path
         self.tags = tags
@@ -79,7 +127,9 @@ class TiktokVideo(object):
         self.thumbnail_path = thumbnail_path
         self.account_file = account_file
         self.local_executable_path = LOCAL_CHROME_PATH
-        self.headless = LOCAL_CHROME_HEADLESS
+        # headless 未显式传入时回落到全局默认(env MPAU_HEADLESS); 批量调度会传 --headed/--headless
+        self.debug = debug
+        self.headless = LOCAL_CHROME_HEADLESS if headless is None else headless
         self.locator_base = None
 
     async def set_schedule_time(self, page, publish_date):
@@ -147,9 +197,15 @@ class TiktokVideo(object):
         await file_chooser.set_files(self.file_path)
 
     async def upload(self, playwright: Playwright) -> None:
-        browser = await playwright.chromium.launch(headless=self.headless, executable_path=self.local_executable_path)
+        # 浏览器选择与 cookie_auth 保持一致: 显式路径 > 系统 Chrome(channel)
+        if self.local_executable_path:
+            browser = await playwright.chromium.launch(
+                headless=self.headless, executable_path=self.local_executable_path
+            )
+        else:
+            browser = await playwright.chromium.launch(headless=self.headless, channel="chrome")
         context = await browser.new_context(storage_state=f"{self.account_file}")
-        # context = await set_init_script(context)
+        context = await set_init_script(context)
         page = await context.new_page()
 
         # change language to eng first

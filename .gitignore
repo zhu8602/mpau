@@ -10,6 +10,7 @@ dist/
 # Runtime data and credentials
 cookies/
 logs/
+data/
 *_login_qrcode_*.png
 *_verify_code.json
 qrcode.png
@@ -28,6 +29,15 @@ Thumbs.db
 # Local agent/workspace metadata
 .pi/
 
+# Test / tool caches
+.pytest_cache/
+
+# Repo-root generated screenshots (tools/shot_*.py 与 UI 校验脚本的输出)
+/*.png
+
+# 打包中间产物(build/ dist/ 已在上方忽略, 这里补 zip)
+package/mpau.zip
+
 # Large media files
 *.mp4
 *.mov
@@ -36,3 +46,8 @@ Thumbs.db
 *.flv
 *.wmv
 *.webm
+
+# Frontend (web/ui)
+node_modules/
+web/ui/dist/
+*.tsbuildinfo

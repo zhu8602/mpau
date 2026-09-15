@@ -11,7 +11,7 @@ from patchright.async_api import Page
 from patchright.async_api import Playwright
 from patchright.async_api import async_playwright
 
-from utils.config import BASE_DIR, DEBUG_MODE, LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
+from utils.config import BASE_DIR, COOKIES_DIR, DEBUG_MODE, LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
 from uploader.base_video import BaseVideoUploader
 from utils.base_social_media import set_init_script
 from utils.log import tencent_logger
@@ -33,7 +33,7 @@ def _resolve_account_file(account_file: str | Path) -> str:
         return str(path)
 
     if len(path.parts) == 1:
-        return str((Path(BASE_DIR) / "cookies" / "tencent_uploader" / path).resolve())
+        return str((COOKIES_DIR / "tencent_uploader" / path).resolve())
 
     return str(path.resolve())
 
@@ -143,45 +143,82 @@ async def cookie_auth(account_file):
             await browser.close()
 
 
-async def _extract_tencent_qrcode_src(page: Page) -> str:
-    if hasattr(page, "frame_locator"):
+async def _find_tencent_qrcode_img(page: Page):
+    """定位当前登录页的二维码 img 元素。
+
+    新版登录页是 qrconnect iframe(open.weixin.qq.com), 二维码为 img.js_qrcode_img,
+    src 是普通 https 地址(非 data:image); 二维码区域可能先显示「加载失败，点击重试」。
+    兼容旧版页内选择器。找不到返回 None。
+    """
+    for attempt in range(6):
+        # 二维码区域加载失败时先点重试
+        retry_btn = page.get_by_text("加载失败，点击重试").first
         try:
-            iframe_locator = page.frame_locator('[src*="login-for-iframe"]')
-            qr_code_img = iframe_locator.locator('div#app img.qrcode').first
-            await qr_code_img.wait_for(state="visible", timeout=30000)
-            src = await qr_code_img.get_attribute("src")
-            if src and src.startswith("data:image/"):
-                return src
+            if await retry_btn.count() and await retry_btn.is_visible():
+                await retry_btn.click(timeout=3000)
+                await asyncio.sleep(3)
         except Exception:
             pass
 
-    selector_candidates = [
-        "div.login-qrcode-wrap img.qrcode",
-        "div.qrcode-wrap img.qrcode",
-        "img.qrcode",
-        'img[src^="data:image/"]',
-    ]
-    for selector in selector_candidates:
-        qr_code_img = page.locator(selector).first
-        try:
-            if not await qr_code_img.count() or not await qr_code_img.is_visible():
-                continue
-            src = await qr_code_img.get_attribute("src")
-            if src and src.startswith("data:image/"):
-                return src
-        except Exception:
-            continue
+        if hasattr(page, "frame_locator"):
+            try:
+                frame = page.frame_locator('iframe[src*="open.weixin.qq.com/connect/qrconnect"]').first
+                # 页面里有多个二维码面板(旧面板 display:none), 取第一个可见的
+                for sel in ("img.js_qrcode_img", "img.web_qrcode_img", "img.qrcode"):
+                    locs = frame.locator(sel)
+                    n = await locs.count()
+                    for i in range(n):
+                        img = locs.nth(i)
+                        if await img.is_visible():
+                            return img
+            except Exception:
+                pass
 
-    raise RuntimeError("未获取到视频号登录二维码地址")
+        for sel in ("div.login-qrcode-wrap img.qrcode", "div.qrcode-wrap img.qrcode", "img.qrcode"):
+            img = page.locator(sel).first
+            try:
+                if await img.count() and await img.is_visible():
+                    return img
+            except Exception:
+                continue
+
+        await asyncio.sleep(2)
+
+    return None
 
 
 async def _save_tencent_qrcode(page: Page, account_file: str, previous_qrcode_path: Path | None = None, qrcode_callback=None) -> dict:
     qrcode_utils = _get_qrcode_utils()
-    qrcode_src = await _extract_tencent_qrcode_src(page)
-    qrcode_path = qrcode_utils["save_data_url_image"](
-        qrcode_src,
-        qrcode_utils["build_login_qrcode_path"](account_file, suffix="tencent_login_qrcode"),
-    )
+    img = await _find_tencent_qrcode_img(page)
+    if img is None:
+        raise RuntimeError("未获取到视频号登录二维码地址")
+
+    qrcode_path = qrcode_utils["build_login_qrcode_path"](account_file, suffix="tencent_login_qrcode")
+    try:
+        src = (await img.get_attribute("src")) or ""
+    except Exception:
+        src = ""
+    if src.startswith("data:image/"):
+        qrcode_path = qrcode_utils["save_data_url_image"](src, qrcode_path)
+    else:
+        # qrconnect iframe 的二维码是 https 地址(可能为相对路径/jpeg),
+        # 用浏览器上下文直接下载(带 cookie); 失败再退回元素截图。
+        if src.startswith("/"):
+            src = "https://open.weixin.qq.com" + src
+        saved = False
+        try:
+            resp = await page.request.get(src, timeout=30000)
+            if resp.ok:
+                body = await resp.body()
+                if body and len(body) > 200:
+                    qrcode_path.parent.mkdir(parents=True, exist_ok=True)
+                    qrcode_path.write_bytes(body)
+                    saved = True
+        except Exception:
+            saved = False
+        if not saved:
+            await img.screenshot(path=str(qrcode_path))
+
     if previous_qrcode_path and previous_qrcode_path != qrcode_path:
         if qrcode_utils["remove_qrcode_file"](previous_qrcode_path):
             tencent_logger.info(_msg("🧹", f"临时二维码文件已清理: {previous_qrcode_path}"))
@@ -200,7 +237,7 @@ async def _save_tencent_qrcode(page: Page, account_file: str, previous_qrcode_pa
 
     qrcode_info = {
         "image_path": str(qrcode_path),
-        "image_data_url": qrcode_src,
+        "image_data_url": src if src.startswith("data:image/") else "",
     }
     await _emit_qrcode_callback(qrcode_callback, qrcode_info)
     return qrcode_info
@@ -252,6 +289,17 @@ async def _is_tencent_qrcode_expired(page: Page) -> bool:
                 return True
         except Exception:
             continue
+
+    # 新版: qrconnect iframe 内的过期/失效提示
+    if hasattr(page, "frame_locator"):
+        try:
+            frame = page.frame_locator('iframe[src*="open.weixin.qq.com/connect/qrconnect"]').first
+            for text in ("二维码已失效", "二维码已过期", "已过期", "网络不可用"):
+                loc = frame.get_by_text(text).first
+                if await loc.count() and await loc.is_visible():
+                    return True
+        except Exception:
+            pass
     return False
 
 
@@ -310,7 +358,24 @@ async def _refresh_tencent_qrcode(page: Page) -> None:
         await fallback_refresh.click()
         return
 
-    raise RuntimeError("未找到可点击的视频号二维码刷新区域")
+    # 新版: qrconnect iframe 内的刷新入口
+    if hasattr(page, "frame_locator"):
+        try:
+            frame = page.frame_locator('iframe[src*="open.weixin.qq.com/connect/qrconnect"]').first
+            for text in ("刷新二维码", "点击刷新", "刷新"):
+                refresh = frame.get_by_text(text).first
+                if await refresh.count() and await refresh.is_visible():
+                    await refresh.click()
+                    return
+        except Exception:
+            pass
+
+    # 兜底: 重试加载 / 整页刷新(二维码会重新生成, _save_tencent_qrcode 会重新截图)
+    try:
+        await page.reload(wait_until="domcontentloaded")
+        await asyncio.sleep(5)
+    except Exception:
+        pass
 
 
 async def _wait_for_tencent_login(
@@ -347,6 +412,43 @@ async def _wait_for_tencent_login(
         await asyncio.sleep(poll_interval)
 
     return _build_login_result(False, "timeout", "等待视频号扫码登录超时", account_file, qrcode_info, page.url)
+
+
+async def _extract_tencent_nickname(page: Page) -> str:
+    """登录成功后的视频号助手页面抓真实昵称(启发式, 抓不到返回空串)。"""
+    try:
+        name = await page.evaluate(
+            """() => {
+              const bad = new Set(['视频号助手','微信小店','机构管理','特效平台','加热平台','联盟带货机构',
+                '首页','内容管理','互动管理','数据中心','收入变现','创作服务','其他服务','作品发布','发表视频']);
+              const cands = [...document.querySelectorAll('div[class*="name"],span[class*="name"]')];
+              for (const el of cands) {
+                const t = (el.innerText || '').trim();
+                if (!t || t.length > 24 || bad.has(t)) continue;
+                let cur = el;
+                for (let i = 0; i < 6 && cur; i++) {
+                  const c = typeof cur.className === 'string' ? cur.className : '';
+                  if (/header|account|avatar|user|profile/i.test(c)) return t;
+                  cur = cur.parentElement;
+                }
+              }
+              return '';
+            }"""
+        )
+        return str(name or "").strip()
+    except Exception:
+        return ""
+
+
+async def fetch_account_nickname(account_file) -> str:
+    """独立抓取视频号助手真实昵称并写入账号元数据(供 `mpau tencent nickname` 与 Web 登录回填)。
+
+    与登录子进程解耦: 网页端「完成登录」会 taskkill 登录进程, 那里尾部的抓取可能来不及执行。
+    失败返回空串, 不影响登录状态。
+    """
+    from utils.nickname import capture_nickname
+
+    return await capture_nickname("tencent", str(account_file), TENCENT_MANAGE_URL, _extract_tencent_nickname)
 
 
 async def tencent_cookie_gen(
@@ -390,6 +492,18 @@ async def tencent_cookie_gen(
                         qrcode_info,
                         page.url,
                     )
+                else:
+                    # 抓取真实昵称用于账号列表展示(失败不影响登录结果)
+                    try:
+                        from pipeline.account_meta import set_nickname
+
+                        nickname = await _extract_tencent_nickname(page)
+                        if nickname:
+                            set_nickname("tencent", Path(account_file).stem, nickname)
+                            tencent_logger.info(_msg("👤", f"已记录平台昵称: {nickname}"))
+                            print(f"[PROFILE] platform=tencent account={Path(account_file).stem} nickname={nickname}", flush=True)
+                    except Exception:
+                        pass
             return result
         except Exception as exc:
             result = _build_login_result(

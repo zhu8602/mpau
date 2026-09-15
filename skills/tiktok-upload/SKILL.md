@@ -23,11 +23,10 @@ cd <PROJECT_ROOT>
 
 ```bash
 uv sync
-python -m playwright install chromium
 python -m patchright install chromium
 ```
 
-TikTok 和百家号的 legacy uploader 使用 Playwright；其他主线浏览器 uploader 主要使用 Patchright。
+全平台 uploader（含 TikTok、百家号）已统一使用 Patchright，无需再装 Playwright 内核。
 
 ## 命令
 

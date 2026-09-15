@@ -120,6 +120,37 @@ async def cookie_auth(account_file):
             await browser.close()
 
 
+async def _extract_tmall_nickname(page: Page) -> str:
+    """淘宝光合平台顶栏用户区抓真实昵称; 多个候选选择器兜底, 抓不到返回空串。"""
+    selectors = [
+        ".user-info-name",
+        ".header-user-info .name",
+        "[class*='user-name']",
+        ".header [class*='nickname']",
+    ]
+    try:
+        for selector in selectors:
+            loc = page.locator(selector).first
+            if await loc.count() and await loc.is_visible():
+                text = (await loc.inner_text()).strip()
+                if text and len(text) <= 24:
+                    return text
+        return ""
+    except Exception:
+        return ""
+
+
+async def fetch_account_nickname(account_file) -> str:
+    """独立抓取淘宝光合平台真实昵称并写入账号元数据(供 `mpau tmall nickname` 与 Web 登录回填)。
+
+    与登录子进程解耦: 网页端「完成登录」会 taskkill 登录进程, 那里尾部的抓取可能来不及执行。
+    失败返回空串, 不影响登录状态。
+    """
+    from utils.nickname import capture_nickname
+
+    return await capture_nickname("tmall", str(account_file), TMALL_CREATOR_HOME_URL, _extract_tmall_nickname)
+
+
 async def tmall_setup(
     account_file,
     handle=False,

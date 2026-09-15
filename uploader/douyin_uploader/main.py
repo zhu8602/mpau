@@ -5,7 +5,9 @@ import asyncio
 import inspect
 import json
 import os
+import re
 import sys
+import time
 from pathlib import Path
 
 from patchright.async_api import Page
@@ -268,7 +270,10 @@ def _build_login_result(success: bool, status: str, message: str, account_file: 
 
 async def cookie_auth(account_file):
     async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(headless=True, channel="chrome")
+        if LOCAL_CHROME_PATH:
+            browser = await playwright.chromium.launch(headless=True, executable_path=LOCAL_CHROME_PATH)
+        else:
+            browser = await playwright.chromium.launch(headless=True, channel="chrome")
         try:
             context = await browser.new_context(storage_state=account_file)
             context = await set_init_script(context)
@@ -366,12 +371,344 @@ async def _is_douyin_login_completed(page: Page) -> bool:
     return True
 
 
-async def _wait_for_douyin_login(page: Page, account_file: str, qrcode_info: dict, qrcode_callback=None, poll_interval: int = 3, max_checks: int = 100) -> dict:
+# ---------------------------------------------------------------------------
+# 登录阶段的「身份验证」处理(扫码确认后抖音可能要求短信验证码)
+# ---------------------------------------------------------------------------
+_IDENTITY_PAGE_TITLE = "身份验证"
+_VERIFY_MODAL_SELECTOR = "#uc-second-verify"
+_RECEIVE_SMS_TEXT_CANDIDATES = ("接收短信验证码", "接收验证码")
+_SEND_SMS_TEXT_CANDIDATES = ("获取验证码", "发送验证码", "重新获取", "重新发送")
+_CONFIRM_BTN_TEXT_CANDIDATES = ("确定", "确认", "验证", "提交", "下一步", "立即验证")
+
+
+async def _identity_page_visible(page: Page) -> bool:
+    """是否停留在登录阶段的「身份验证」弹窗(uc-second-verify)。"""
+    try:
+        title = page.get_by_text(_IDENTITY_PAGE_TITLE, exact=True).first
+        if await title.count() and await title.is_visible():
+            return True
+        # 兜底: uc-second-verify 弹窗内出现验证方式/发送入口
+        modal = page.locator(_VERIFY_MODAL_SELECTOR)
+        if await modal.count() and await modal.is_visible():
+            for t in _RECEIVE_SMS_TEXT_CANDIDATES + _SEND_SMS_TEXT_CANDIDATES:
+                loc = modal.get_by_text(t, exact=True).first
+                if await loc.count() and await loc.is_visible():
+                    return True
+        return False
+    except Exception:
+        return False
+
+
+async def _extract_identity_phone_hint(page: Page) -> str:
+    """从页面文本里提取手机号/用户标识, 用于提示用户。"""
+    try:
+        text = await page.locator("body").inner_text(timeout=3000)
+    except Exception:
+        return ""
+    m = re.search(r"用户\d{5,}|1[3-9]\d{9}|\d{3}\*{3,4}\d{3,4}", text)
+    return m.group(0) if m else ""
+
+
+_DOUYIN_NICKNAME_JS = """() => {
+  // 昵称在创作者首页的账号卡片里: class 以 name- 开头且祖先链含 header-(页脚链接不满足)
+  const nodes = [...document.querySelectorAll('div[class*="name-"]')];
+  for (const el of nodes) {
+    const t = (el.innerText || '').trim();
+    if (!t || t.length > 24) continue;
+    let cur = el;
+    let hit = false;
+    for (let i = 0; i < 6 && cur; i++) {
+      const c = typeof cur.className === 'string' ? cur.className : '';
+      if (c.indexOf('header-') === 0) { hit = true; break; }
+      cur = cur.parentElement;
+    }
+    if (hit) return t;
+  }
+  return '';
+}"""
+
+
+async def _extract_douyin_nickname(page: Page) -> str:
+    """登录成功后的创作者首页上抓真实昵称; 抓不到返回空串(不影响登录)。"""
+    try:
+        name = await page.evaluate(_DOUYIN_NICKNAME_JS)
+        if name:
+            return str(name).strip()
+        # 兜底: 通过「抖音号」锚点找同卡片昵称
+        fallback = await page.evaluate(
+            """() => {
+              const nodes = [...document.querySelectorAll('*')];
+              const anchor = nodes.find(el => el.children.length === 0 && /抖音号[：:]/.test((el.textContent || '').slice(0, 20)));
+              if (!anchor) return '';
+              let box = anchor.parentElement;
+              for (let i = 0; i < 6 && box; i++) {
+                const cand = box.querySelector('div[class*="name-"]');
+                if (cand) { const t = (cand.innerText || '').trim(); if (t && t.length <= 24) return t; }
+                box = box.parentElement;
+              }
+              return '';
+            }"""
+        )
+        return str(fallback or "").strip()
+    except Exception:
+        return ""
+
+
+async def fetch_account_nickname(account_file) -> str:
+    """独立抓取创作者首页真实昵称并写入账号元数据(供 `mpau douyin nickname` 与 Web 登录回填)。
+
+    与登录子进程解耦: 网页端「完成登录」会 taskkill 登录进程, 那里尾部的抓取可能来不及执行。
+    失败返回空串, 不影响登录状态。
+    """
+    from utils.nickname import capture_nickname
+
+    return await capture_nickname("douyin", str(account_file), "https://creator.douyin.com/", _extract_douyin_nickname)
+
+
+async def _dump_identity_debug(page: Page, account_file: str, tag: str) -> None:
+    """身份验证页面截图 + HTML 存档, 便于排查选择器; 顺带清理 7 天前的旧存档。"""
+    try:
+        cookies_dir = Path(account_file).parent
+        stem = Path(account_file).stem
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        png_path = cookies_dir / f"identity_{stem}_{tag}_{ts}.png"
+        html_path = cookies_dir / f"identity_{stem}_{tag}_{ts}.html"
+        await page.screenshot(path=str(png_path), full_page=False)
+        html_path.write_text(await page.content(), encoding="utf-8")
+        douyin_logger.debug(_msg("📸", f"身份验证页面已存档: {png_path} / {html_path}"))
+        cutoff = time.time() - 7 * 24 * 3600
+        for pattern in (f"identity_{stem}_*.png", f"identity_{stem}_*.html"):
+            for f in cookies_dir.glob(pattern):
+                try:
+                    if f.stat().st_mtime < cutoff:
+                        f.unlink()
+                except OSError:
+                    pass
+    except Exception as e:
+        douyin_logger.debug(_msg("📸", f"身份验证页面存档失败: {e}"))
+
+
+async def _modal_code_input(modal):
+    """在验证弹窗内找验证码输入框(限定弹窗, 避免误填弹窗下面的手机号登录表单)。"""
+    for sel in ("input[placeholder*='验证码']", "input[maxlength='6']"):
+        loc = modal.locator(sel).first
+        try:
+            await loc.wait_for(state="visible", timeout=1500)
+            return loc
+        except Exception:
+            continue
+    try:
+        locs = modal.locator("input")
+        n = await locs.count()
+        for i in range(min(n, 6)):
+            el = locs.nth(i)
+            try:
+                ml = (await el.get_attribute("maxlength")) or ""
+                ph = (await el.get_attribute("placeholder")) or ""
+                if ph and "验证码" in ph:
+                    if await el.is_visible():
+                        return el
+                if ml.isdigit() and 4 <= int(ml) <= 8:
+                    if await el.is_visible():
+                        return el
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
+
+
+async def _handle_login_identity_verify(page: Page, account_file: str) -> bool:
+    """
+    登录阶段处理抖音「身份验证」弹窗(uc-second-verify):
+    选择「接收短信验证码」方式 → 点发送验证码 → stdout 打印 [VERIFY_REQUIRED]
+    → 轮询验证码文件 → 填入弹窗输入框 → 点确认。
+    返回 True 表示已按自动流程处理过(无论成败); False 表示未处理(页面已变化/需要人工)。
+    """
+    if not await _identity_page_visible(page):
+        return False
+
+    account = Path(account_file).stem
+    douyin_logger.warning(_msg("🔐", f"检测到登录身份验证弹窗: {page.url}"))
+    await _dump_identity_debug(page, account_file, "detected")
+    phone_hint = await _extract_identity_phone_hint(page)
+    modal = page.locator(_VERIFY_MODAL_SELECTOR)
+
+    # 1) 先选择「接收短信验证码」方式(走接收验证码, 便于填入辅助验证)
+    chosen = False
+    for t in _RECEIVE_SMS_TEXT_CANDIDATES:
+        opt = modal.get_by_text(t, exact=True).first
+        try:
+            if await opt.count() and await opt.is_visible():
+                await opt.click(timeout=5000)
+                chosen = True
+                douyin_logger.info(_msg("☑️", f"已选择「{t}」"))
+                break
+        except Exception:
+            continue
+
+    if not chosen:
+        douyin_logger.warning(_msg("🧍", "没找到「接收短信验证码」选项, 请在浏览器窗口中手动完成身份验证"))
+        print(f"[MANUAL_ACTION] 登录身份验证需要人工操作 account={account} url={page.url}", flush=True)
+        return False
+
+    # 2) 等待发送验证码按钮出现(点击选项后渲染, 最多 10 秒)
+    send_btn = None
+    for _ in range(10):
+        for t in _SEND_SMS_TEXT_CANDIDATES:
+            loc = modal.get_by_text(t, exact=True).first
+            try:
+                if await loc.count() and await loc.is_visible():
+                    send_btn = loc
+                    break
+            except Exception:
+                continue
+        if send_btn is not None:
+            break
+        await asyncio.sleep(1)
+
+    code_input = await _modal_code_input(modal)
+    if send_btn is None and code_input is None:
+        douyin_logger.warning(_msg("🧍", "未找到发送按钮/验证码输入框, 请在浏览器窗口中手动完成身份验证"))
+        print(f"[MANUAL_ACTION] 登录身份验证需要人工操作 account={account} url={page.url}", flush=True)
+        await _dump_identity_debug(page, account_file, "no_send_btn")
+        return False
+
+    # 3) 点发送验证码
+    if send_btn is not None:
+        sent = False
+        for _ in range(3):
+            try:
+                await send_btn.click(timeout=5000)
+                sent = True
+                break
+            except Exception:
+                await asyncio.sleep(1)
+        if not sent:
+            try:
+                await send_btn.click(force=True, timeout=3000)
+                sent = True
+            except Exception:
+                pass
+        if not sent:
+            douyin_logger.warning(_msg("🧍", "发送验证码按钮点不动, 请在浏览器窗口中手动点击并输入"))
+            print(f"[MANUAL_ACTION] 请手动点击发送验证码 account={account}", flush=True)
+            return False
+        douyin_logger.info(_msg("📤", "已点击发送验证码"))
+
+    print(f"[VERIFY_REQUIRED] phone={phone_hint} account={account}", flush=True)
+    douyin_logger.info(_msg("⏳", "等待短信验证码... (网页任务日志里有输入框, 也可直接在浏览器窗口中手动输入)"))
+
+    # 4) 轮询验证码文件, 最长 5 分钟; 弹窗消失说明用户手动完成或关闭了
+    code_path = _verify_code_path(account_file)
+    code_path.unlink(missing_ok=True)
+    got_code = False
+    for _ in range(150):
+        await asyncio.sleep(2)
+        if code_path.exists():
+            got_code = True
+            break
+        if not await _identity_page_visible(page):
+            douyin_logger.info(_msg("✅", "身份验证弹窗已消失(可能已在浏览器中手动完成或关闭)"))
+            return False
+
+    if not got_code:
+        douyin_logger.error(_msg("😵", "等待验证码超时(5分钟), 可在浏览器中手动完成, 或重新发起登录"))
+        return True
+
+    try:
+        code_data = json.loads(code_path.read_text(encoding="utf-8"))
+        code = str(code_data.get("code", "")).strip()
+    except Exception as e:
+        douyin_logger.error(_msg("😵", f"读取验证码文件失败: {e}"))
+        code = ""
+    code_path.unlink(missing_ok=True)
+
+    if not code:
+        return True
+
+    # 5) 验证码输入框(发送后可能才渲染, 重新查找)
+    if code_input is None:
+        for _ in range(8):
+            await asyncio.sleep(1)
+            code_input = await _modal_code_input(modal)
+            if code_input is not None:
+                break
+
+    if code_input is None:
+        douyin_logger.error(_msg("😵", "找不到验证码输入框, 请在浏览器窗口中手动输入"))
+        await _dump_identity_debug(page, account_file, "no_input")
+        return True
+
+    try:
+        await code_input.click()
+        await code_input.fill("")
+    except Exception:
+        pass
+    await code_input.press_sequentially(code, delay=80)
+    douyin_logger.info(_msg("🔢", f"验证码已输入: {code}"))
+    await asyncio.sleep(0.3)
+
+    # 6) 确认按钮(限定在弹窗内)
+    clicked = False
+    for t in _CONFIRM_BTN_TEXT_CANDIDATES:
+        locators = [
+            modal.get_by_role("button", name=re.compile(f"^{re.escape(t)}$")).first,
+            modal.get_by_text(t, exact=True).first,
+        ]
+        for btn in locators:
+            try:
+                if not await btn.count() or not await btn.is_visible():
+                    continue
+                for _ in range(6):
+                    try:
+                        await btn.click(timeout=2000)
+                        clicked = True
+                        break
+                    except Exception:
+                        await asyncio.sleep(1)
+            except Exception:
+                pass
+            if clicked:
+                douyin_logger.info(_msg("✅", f"已点击「{t}」按钮"))
+                break
+        if clicked:
+            break
+
+    if not clicked:
+        douyin_logger.warning(_msg("🧍", "没找到确认按钮, 请在浏览器窗口中手动点击确认"))
+        await _dump_identity_debug(page, account_file, "no_confirm")
+
+    # 等弹窗消失, 最长 15 秒
+    for _ in range(30):
+        await asyncio.sleep(0.5)
+        if not await _identity_page_visible(page):
+            douyin_logger.info(_msg("✅", "身份验证已提交, 弹窗已关闭"))
+            return True
+
+    douyin_logger.warning(_msg("⚠️", "身份验证弹窗仍在, 验证码可能不正确"))
+    return True
+
+
+async def _wait_for_douyin_login(page: Page, account_file: str, qrcode_info: dict, qrcode_callback=None, poll_interval: int = 3, max_checks: int = 200) -> dict:
     qrcode_path = Path(qrcode_info["image_path"])
-    for _ in range(max_checks):
+    checks = 0
+    identity_handled = False
+    while checks < max_checks:
         if await _is_douyin_login_completed(page):
             douyin_logger.info(_msg("🥳", f"扫码成功，已经跳转到登录后页面: {page.url}"))
             return _build_login_result(True, "success", "抖音扫码登录成功", account_file, qrcode_info, page.url)
+
+        # 扫码确认后抖音可能要求「身份验证」(短信验证码), 登录流程也要能处理。
+        # 每次登录只自动处理一次; 弹窗被关掉/验证未通过时不再反复点击,
+        # 避免把验证弹窗反复拉起(用户反馈的"关掉之后一直弹"问题)。
+        if await _identity_page_visible(page):
+            if not identity_handled:
+                identity_handled = True
+                handled = await _handle_login_identity_verify(page, account_file)
+                checks = 0  # 身份验证等待时间不计入登录超时
+                if handled and await _identity_page_visible(page):
+                    douyin_logger.warning(_msg("🧍", "身份验证未通过: 不再自动重试, 请在浏览器窗口中手动完成; 若已关闭弹窗, 系统会继续等待登录成功"))
 
         expired_box = page.get_by_text("二维码失效", exact=True).locator("..").first
         if await expired_box.count() and await expired_box.is_visible():
@@ -382,7 +719,10 @@ async def _wait_for_douyin_login(page: Page, account_file: str, qrcode_info: dic
             qrcode_path = Path(qrcode_info["image_path"])
 
         await asyncio.sleep(poll_interval)
+        checks += 1
 
+    if await _identity_page_visible(page):
+        return _build_login_result(False, "timeout", "等待抖音身份验证超时, 请在浏览器窗口中完成短信验证后重试登录", account_file, qrcode_info, page.url)
     return _build_login_result(False, "timeout", "等待抖音扫码登录超时", account_file, qrcode_info, page.url)
 
 
@@ -390,16 +730,23 @@ async def douyin_cookie_gen(
     account_file,
     qrcode_callback=None,
     poll_interval: int = 3,
-    max_checks: int = 100,
+    max_checks: int = 200,
     headless: bool = LOCAL_CHROME_HEADLESS,
 ):
     async with async_playwright() as playwright:
         _existing_hwnds = _snapshot_chrome_hwnds()
-        browser = await playwright.chromium.launch(
-            headless=headless,
-            channel="chrome",
-            args=["--force-device-scale-factor=1"],
-        )
+        if LOCAL_CHROME_PATH:
+            browser = await playwright.chromium.launch(
+                headless=headless,
+                executable_path=LOCAL_CHROME_PATH,
+                args=["--force-device-scale-factor=1"],
+            )
+        else:
+            browser = await playwright.chromium.launch(
+                headless=headless,
+                channel="chrome",
+                args=["--force-device-scale-factor=1"],
+            )
         if not headless:
             asyncio.create_task(_reposition_browser_window(_existing_hwnds))
         context = await browser.new_context(
@@ -434,6 +781,18 @@ async def douyin_cookie_gen(
                         qrcode_info,
                         page.url,
                     )
+                else:
+                    # 抓取真实昵称用于账号列表展示(失败不影响登录结果)
+                    try:
+                        from pipeline.account_meta import set_nickname
+
+                        nickname = await _extract_douyin_nickname(page)
+                        if nickname:
+                            set_nickname("douyin", Path(account_file).stem, nickname)
+                            douyin_logger.info(_msg("👤", f"已记录平台昵称: {nickname}"))
+                            print(f"[PROFILE] platform=douyin account={Path(account_file).stem} nickname={nickname}", flush=True)
+                    except Exception:
+                        pass
         except Exception as exc:
             result = _build_login_result(False, "failed", str(exc), account_file, current_url=page.url if "page" in locals() else "")
         finally:
@@ -818,7 +1177,10 @@ class DouYinVideo(DouYinBaseUploader):
         douyin_logger.info(_msg("🥳", "上传前检查通过"))
 
         _existing_hwnds = _snapshot_chrome_hwnds()
-        browser = await playwright.chromium.launch(headless=self.headless, channel="chrome")
+        if LOCAL_CHROME_PATH:
+            browser = await playwright.chromium.launch(headless=self.headless, executable_path=LOCAL_CHROME_PATH)
+        else:
+            browser = await playwright.chromium.launch(headless=self.headless, channel="chrome")
         if not self.headless:
             asyncio.create_task(_reposition_browser_window(_existing_hwnds))
         context = await browser.new_context(
@@ -1033,7 +1395,10 @@ class DouYinNote(DouYinBaseUploader):
         douyin_logger.info(_msg("🥳", "图文上传前检查通过"))
 
         _existing_hwnds = _snapshot_chrome_hwnds()
-        browser = await playwright.chromium.launch(headless=self.headless, channel="chrome")
+        if LOCAL_CHROME_PATH:
+            browser = await playwright.chromium.launch(headless=self.headless, executable_path=LOCAL_CHROME_PATH)
+        else:
+            browser = await playwright.chromium.launch(headless=self.headless, channel="chrome")
         if not self.headless:
             asyncio.create_task(_reposition_browser_window(_existing_hwnds))
         context = await browser.new_context(

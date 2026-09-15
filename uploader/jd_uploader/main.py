@@ -125,6 +125,37 @@ async def jd_setup(account_file, handle=False, return_detail=False, qrcode_callb
     return result if return_detail else True
 
 
+async def _extract_jd_nickname(page) -> str:
+    """京东京麦后台顶栏用户区抓真实昵称; 抓不到返回空串。"""
+    candidate_selectors = (
+        "div[class*='header'] [class*='user-name']",
+        "[class*='user-info'] [class*='name']",
+        "div[class*='header'] [class*='user'] [class*='name']",
+        "[class*='nickname']",
+    )
+    try:
+        for selector in candidate_selectors:
+            loc = page.locator(selector).first
+            if await loc.count() and await loc.is_visible():
+                text = (await loc.inner_text()).strip()
+                if text and len(text) <= 24:
+                    return text
+        return ""
+    except Exception:
+        return ""
+
+
+async def fetch_account_nickname(account_file) -> str:
+    """独立抓取京东京麦真实昵称并写入账号元数据(供 `mpau jd nickname` 命令与 Web 登录回填)。
+
+    与登录子进程解耦: 网页端「完成登录」会 taskkill 登录进程, 那里尾部的抓取可能来不及执行。
+    失败返回空串, 不影响登录状态。
+    """
+    from utils.nickname import capture_nickname
+
+    return await capture_nickname("jd", str(account_file), JD_POST_CENTER_URL, _extract_jd_nickname)
+
+
 async def jd_cookie_gen(account_file, headless: bool = LOCAL_CHROME_HEADLESS,
                         qrcode_callback=None, poll_interval: int = 3, max_checks: int = 200):
     """打开京麦发布中心，等待用户在浏览器内完成登录（密码 / 短信 / 扫码），成功后保存 storage_state。"""

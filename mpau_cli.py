@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterable, Sequence
 
-from utils.config import BASE_DIR
+from utils.config import MPAU_HOME
 from uploader.bilibili_uploader.runtime import run_biliup_command
 from uploader.douyin_uploader.main import (
     DOUYIN_PUBLISH_STRATEGY_IMMEDIATE,
@@ -105,6 +105,7 @@ class KuaishouVideoUploadRequest:
     publish_date: datetime | int
     thumbnail_file: Path | None = None
     publish_strategy: str = KUAISHOU_PUBLISH_STRATEGY_IMMEDIATE
+    goods_name: str = ""
     debug: bool = True
     headless: bool = True
 
@@ -171,6 +172,8 @@ class TiktokVideoUploadRequest:
     tags: list[str]
     publish_date: datetime | int
     thumbnail_file: Path | None = None
+    debug: bool = True
+    headless: bool = True
 
 @dataclass(slots=True)
 class PddVideoUploadRequest:
@@ -234,7 +237,7 @@ def has_interactive_terminal() -> bool:
     return sys.stdin.isatty() and sys.stdout.isatty()
 
 def resolve_runtime_home() -> Path:
-    return Path(BASE_DIR)
+    return Path(MPAU_HOME)
 
 def resolve_account_file(platform: str, account_name: str) -> Path:
     account_file = resolve_runtime_home() / "cookies" / f"{platform}_{account_name}.json"
@@ -386,6 +389,44 @@ async def check_jd_account(account_name: str) -> bool:
         return False
     return await jd_cookie_auth(str(account_file))
 
+
+# 昵称抓取(fetch_account_nickname)懒加载表: 平台 -> 上传器模块
+_NICKNAME_FETCHERS = {
+    "douyin": "uploader.douyin_uploader.main",
+    "kuaishou": "uploader.ks_uploader.main",
+    "xiaohongshu": "uploader.xiaohongshu_uploader.main",
+    "tencent": "uploader.tencent_uploader.main",
+    "pdd": "uploader.pdd_uploader.main",
+    "tmall": "uploader.tmall_uploader.main",
+    "jd": "uploader.jd_uploader.main",
+    "baijiahao": "uploader.baijiahao_uploader.main",
+    "tiktok": "uploader.tk_uploader.main_chrome",
+}
+
+
+async def run_nickname_command(platform: str, account_name: str) -> int:
+    """抓取平台真实昵称写入账号元数据(供 Web 登录后回填/手动刷新); 抓不到返回 1。
+
+    独立于登录进程执行: 网页端「完成登录」会 taskkill 登录进程, 登录进程尾部的抓取可能来不及跑。
+    """
+    import importlib
+
+    module_path = _NICKNAME_FETCHERS.get(platform)
+    if not module_path:
+        print(f"nickname: 平台 {platform} 暂不支持昵称抓取")
+        return 1
+    account_file = resolve_account_file(platform, account_name)
+    if not account_file.exists():
+        print(f"nickname: Cookie 文件不存在: {account_file}")
+        return 1
+    fetch = getattr(importlib.import_module(module_path), "fetch_account_nickname")
+    nickname = await fetch(str(account_file))
+    if nickname:
+        print(f"[PROFILE] platform={platform} account={account_name} nickname={nickname}", flush=True)
+        return 0
+    print("nickname: 未抓到昵称(不影响登录状态)")
+    return 1
+
 async def upload_jd_video(request: JdVideoUploadRequest) -> Path:
     account_file = resolve_account_file("jd", request.account_name)
     is_ready = await jd_setup(str(account_file), handle=False)
@@ -459,6 +500,7 @@ async def upload_kuaishou_video(request: KuaishouVideoUploadRequest) -> Path:
         account_file=str(account_file),
         thumbnail_path=str(request.thumbnail_file) if request.thumbnail_file else None,
         publish_strategy=request.publish_strategy,
+        goods_name=request.goods_name or None,
         debug=request.debug,
         headless=request.headless,
     )
@@ -599,6 +641,8 @@ async def upload_tiktok_video(request: TiktokVideoUploadRequest) -> Path:
         request.publish_date,
         str(account_file),
         str(request.thumbnail_file) if request.thumbnail_file else None,
+        debug=request.debug,
+        headless=request.headless,
     )
     await app.main()
     return account_file
@@ -740,7 +784,7 @@ def build_parser() -> argparse.ArgumentParser:
     douyin_parser = platform_parsers.add_parser("douyin", help="Douyin operations")
     douyin_actions = douyin_parser.add_subparsers(dest="action", required=True)
 
-    for action_name in ("login", "check"):
+    for action_name in ("login", "check", "nickname"):
         action_parser = douyin_actions.add_parser(action_name, help=f"Douyin {action_name}")
         action_parser.add_argument("--account", required=True, help="Douyin user-defined account_name")
         if action_name == "login":
@@ -777,7 +821,7 @@ def build_parser() -> argparse.ArgumentParser:
     kuaishou_parser = platform_parsers.add_parser("kuaishou", help="Kuaishou operations")
     kuaishou_actions = kuaishou_parser.add_subparsers(dest="action", required=True)
 
-    for action_name in ("login", "check"):
+    for action_name in ("login", "check", "nickname"):
         action_parser = kuaishou_actions.add_parser(action_name, help=f"Kuaishou {action_name}")
         action_parser.add_argument("--account", required=True, help="Kuaishou user-defined account_name")
         if action_name == "login":
@@ -791,6 +835,8 @@ def build_parser() -> argparse.ArgumentParser:
     kuaishou_upload_video_parser.add_argument("--tags", default="", help="Comma-separated tags, such as tag1,tag2")
     kuaishou_upload_video_parser.add_argument("--schedule", type=schedule_value, help=f"Schedule time in {schedule_help}")
     kuaishou_upload_video_parser.add_argument("--thumbnail", type=existing_file_path, help="Optional thumbnail path")
+    # 快手只支持按商品名称关联商品(不支持商品ID)
+    kuaishou_upload_video_parser.add_argument("--goods-name", default="", help="Kuaishou goods NAME to attach (must match the name in 快手小店)")
     add_runtime_flags(kuaishou_upload_video_parser)
 
     kuaishou_upload_note_parser = kuaishou_actions.add_parser("upload-note", help="Upload one note to Kuaishou")
@@ -805,7 +851,7 @@ def build_parser() -> argparse.ArgumentParser:
     xiaohongshu_parser = platform_parsers.add_parser("xiaohongshu", help="Xiaohongshu operations")
     xiaohongshu_actions = xiaohongshu_parser.add_subparsers(dest="action", required=True)
 
-    for action_name in ("login", "check"):
+    for action_name in ("login", "check", "nickname"):
         action_parser = xiaohongshu_actions.add_parser(action_name, help=f"Xiaohongshu {action_name}")
         action_parser.add_argument("--account", required=True, help="Xiaohongshu user-defined account_name")
         if action_name == "login":
@@ -833,7 +879,7 @@ def build_parser() -> argparse.ArgumentParser:
     bilibili_parser = platform_parsers.add_parser("bilibili", help="Bilibili operations")
     bilibili_actions = bilibili_parser.add_subparsers(dest="action", required=True)
 
-    for action_name in ("login", "check"):
+    for action_name in ("login", "check", "nickname"):
         action_parser = bilibili_actions.add_parser(action_name, help=f"Bilibili {action_name}")
         action_parser.add_argument("--account", required=True, help="Bilibili user-defined account_name")
 
@@ -849,7 +895,7 @@ def build_parser() -> argparse.ArgumentParser:
     baijiahao_parser = platform_parsers.add_parser("baijiahao", help="Baijiahao operations")
     baijiahao_actions = baijiahao_parser.add_subparsers(dest="action", required=True)
 
-    for action_name in ("login", "check"):
+    for action_name in ("login", "check", "nickname"):
         action_parser = baijiahao_actions.add_parser(action_name, help=f"Baijiahao {action_name}")
         action_parser.add_argument("--account", required=True, help="Baijiahao user-defined account_name")
 
@@ -863,7 +909,7 @@ def build_parser() -> argparse.ArgumentParser:
     tiktok_parser = platform_parsers.add_parser("tiktok", help="TikTok operations")
     tiktok_actions = tiktok_parser.add_subparsers(dest="action", required=True)
 
-    for action_name in ("login", "check"):
+    for action_name in ("login", "check", "nickname"):
         action_parser = tiktok_actions.add_parser(action_name, help=f"TikTok {action_name}")
         action_parser.add_argument("--account", required=True, help="TikTok user-defined account_name")
 
@@ -874,11 +920,13 @@ def build_parser() -> argparse.ArgumentParser:
     tiktok_upload_video_parser.add_argument("--tags", default="", help="Comma-separated tags, such as tag1,tag2")
     tiktok_upload_video_parser.add_argument("--schedule", type=schedule_value, help=f"Schedule time in {schedule_help}")
     tiktok_upload_video_parser.add_argument("--thumbnail", type=existing_file_path, help="Optional thumbnail path")
+    # 批量调度器会追加 --headed/--headless(planner.build_upload_cmd), 缺了会直接 argparse 报错
+    add_runtime_flags(tiktok_upload_video_parser)
 
     pdd_parser = platform_parsers.add_parser("pdd", help="Pinduoduo (Duoduo Video) operations")
     pdd_actions = pdd_parser.add_subparsers(dest="action", required=True)
 
-    for action_name in ("login", "check"):
+    for action_name in ("login", "check", "nickname"):
         action_parser = pdd_actions.add_parser(action_name, help=f"PDD {action_name}")
         action_parser.add_argument("--account", required=True, help="PDD user-defined account_name")
         if action_name == "login":
@@ -897,7 +945,7 @@ def build_parser() -> argparse.ArgumentParser:
     tmall_parser = platform_parsers.add_parser("tmall", help="Tmall/Taobao Guanghe operations")
     tmall_actions = tmall_parser.add_subparsers(dest="action", required=True)
 
-    for action_name in ("login", "check"):
+    for action_name in ("login", "check", "nickname"):
         action_parser = tmall_actions.add_parser(action_name, help=f"Tmall {action_name}")
         action_parser.add_argument("--account", required=True, help="Tmall user-defined account_name")
         if action_name == "login":
@@ -918,7 +966,7 @@ def build_parser() -> argparse.ArgumentParser:
     jd_parser = platform_parsers.add_parser("jd", help="JD Jingmai (京东京麦) operations")
     jd_actions = jd_parser.add_subparsers(dest="action", required=True)
 
-    for action_name in ("login", "check"):
+    for action_name in ("login", "check", "nickname"):
         action_parser = jd_actions.add_parser(action_name, help=f"JD {action_name}")
         action_parser.add_argument("--account", required=True, help="JD user-defined account_name")
         if action_name == "login":
@@ -938,7 +986,7 @@ def build_parser() -> argparse.ArgumentParser:
     tencent_parser = platform_parsers.add_parser("tencent", help="Tencent WeChat Channel (视频号) operations")
     tencent_actions = tencent_parser.add_subparsers(dest="action", required=True)
 
-    for action_name in ("login", "check"):
+    for action_name in ("login", "check", "nickname"):
         action_parser = tencent_actions.add_parser(action_name, help=f"Tencent {action_name}")
         action_parser.add_argument("--account", required=True, help="Tencent user-defined account_name")
         if action_name == "login":
@@ -958,9 +1006,16 @@ def build_parser() -> argparse.ArgumentParser:
     tencent_upload_video_parser.add_argument("--draft", dest="is_draft", action="store_true", help="Save as draft instead of publishing")
     add_runtime_flags(tencent_upload_video_parser)
 
+    # 批量发布引擎(与 Web /api/batch/* 共用 pipeline 包)
+    from pipeline.batch_runner import build_batch_parser
+    build_batch_parser(platform_parsers)
+
     return parser
 
 async def dispatch(args: argparse.Namespace) -> int:
+    if args.action == "nickname":
+        return await run_nickname_command(args.platform, args.account)
+
     if args.platform == "douyin":
         if args.action == "login":
             result = await login_douyin_account(args.account, headless=args.headless)
@@ -1050,6 +1105,7 @@ async def dispatch(args: argparse.Namespace) -> int:
                 publish_date=args.schedule or 0,
                 thumbnail_file=args.thumbnail,
                 publish_strategy=publish_strategy,
+                goods_name=getattr(args, "goods_name", ""),
                 debug=args.debug,
                 headless=args.headless,
             )
@@ -1202,6 +1258,8 @@ async def dispatch(args: argparse.Namespace) -> int:
                 tags=parse_tags(args.tags),
                 publish_date=args.schedule or 0,
                 thumbnail_file=args.thumbnail,
+                debug=args.debug,
+                headless=args.headless,
             )
             await upload_tiktok_video(request)
             print(f"TikTok video upload submitted: {request.video_file}")
@@ -1353,6 +1411,10 @@ async def dispatch(args: argparse.Namespace) -> int:
             return 0
 
         raise RuntimeError(f"Unsupported Tencent action: {args.action}")
+
+    if args.platform == "batch":
+        from pipeline.batch_runner import dispatch_batch
+        return dispatch_batch(args)
 
     raise RuntimeError(f"Unsupported platform: {args.platform}")
 

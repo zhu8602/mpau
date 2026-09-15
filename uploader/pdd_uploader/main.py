@@ -181,6 +181,41 @@ async def pdd_cookie_gen(
         return result
 
 
+async def _extract_pdd_nickname(page: Page) -> str:
+    """拼多多商家后台(mms.pinduoduo.com)顶栏用户区抓真实昵称; 抓不到返回空串。
+
+    顶栏账号区的具体 class 名可能随版本变化, 这里按常见结构给多个候选选择器兜底;
+    全部落空时返回空串, 由 capture_nickname 的通用启发式再兜一次。
+    """
+    selectors = (
+        '[class*="userInfo"] [class*="name"]',
+        '[class*="user-info"] [class*="name"]',
+        'span[class*="userName"]',
+        'div[class*="header"] [class*="nickName"]',
+    )
+    try:
+        for selector in selectors:
+            loc = page.locator(selector).first
+            if await loc.count() and await loc.is_visible():
+                text = (await loc.inner_text()).strip()
+                if text and len(text) <= 24:
+                    return text
+        return ""
+    except Exception:
+        return ""
+
+
+async def fetch_account_nickname(account_file) -> str:
+    """独立抓取拼多多商家后台真实昵称并写入账号元数据(供 `mpau pdd nickname` 与 Web 登录回填)。
+
+    与登录子进程解耦: 网页端「完成登录」会 taskkill 登录进程, 那里尾部的抓取可能来不及执行。
+    失败返回空串, 不影响登录状态。
+    """
+    from utils.nickname import capture_nickname
+
+    return await capture_nickname("pdd", str(account_file), PDD_MMS_HOME_URL, _extract_pdd_nickname)
+
+
 class PDDBaseUploader(BaseVideoUploader):
     def __init__(
         self,

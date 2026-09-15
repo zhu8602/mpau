@@ -1,0 +1,92 @@
+/* 深空暗色主题：对齐设计稿色板，覆盖 Element Plus dark 变量 */
+:root {
+  --mpau-bg: #06080f;
+  --mpau-bg-soft: #0b1020;
+  --mpau-card: rgba(20, 26, 46, 0.72);
+  --mpau-card-solid: #121828;
+  --mpau-border: rgba(99, 102, 241, 0.18);
+  --mpau-border-soft: rgba(148, 163, 184, 0.12);
+  --mpau-text: #e5e9f5;
+  --mpau-text-dim: #8b93ad;
+  --mpau-primary: #6366f1;
+  --mpau-violet: #8b5cf6;
+  --mpau-cyan: #22d3ee;
+  --mpau-grad: linear-gradient(135deg, #6366f1, #8b5cf6 55%, #22d3ee);
+  --mpau-ok: #34d399;
+  --mpau-warn: #fbbf24;
+  --mpau-err: #f87171;
+  --mpau-info: #60a5fa;
+  --mpau-radius: 14px;
+}
+
+html.dark {
+  --el-bg-color: #121828;
+  --el-bg-color-overlay: #171e33;
+  --el-fill-color-blank: #0e1424;
+  --el-border-color: rgba(148, 163, 184, 0.16);
+  --el-border-color-light: rgba(148, 163, 184, 0.12);
+  --el-border-color-lighter: rgba(148, 163, 184, 0.1);
+  --el-text-color-primary: #e5e9f5;
+  --el-text-color-regular: #c3c9dd;
+  --el-color-primary: #6366f1;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background:
+    radial-gradient(1000px 500px at 85% -10%, rgba(34, 211, 238, 0.08), transparent 60%),
+    radial-gradient(900px 480px at 8% -8%, rgba(99, 102, 241, 0.14), transparent 60%),
+    radial-gradient(760px 520px at 55% 118%, rgba(139, 92, 246, 0.1), transparent 60%),
+    var(--mpau-bg);
+  color: var(--mpau-text);
+  font-family: 'PingFang SC', 'Microsoft YaHei', 'Helvetica Neue', Arial, sans-serif;
+  font-size: 14px;
+  min-height: 100vh;
+}
+
+#app { min-height: 100vh; }
+
+/* 通用卡片 */
+.mpau-card {
+  background: var(--mpau-card);
+  border: 1px solid var(--mpau-border-soft);
+  border-radius: var(--mpau-radius);
+  backdrop-filter: blur(10px);
+  padding: 16px 18px;
+}
+
+.mpau-card-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  font-weight: 600;
+  margin: 0 0 12px;
+  color: var(--mpau-text);
+}
+
+/* 渐变主按钮 */
+.mpau-btn-grad {
+  background: var(--mpau-grad) !important;
+  border: none !important;
+  color: #fff !important;
+  font-weight: 600;
+}
+.mpau-btn-grad:hover { opacity: 0.9; }
+
+/* 状态色 */
+.mpau-ok { color: var(--mpau-ok); }
+.mpau-warn { color: var(--mpau-warn); }
+.mpau-err { color: var(--mpau-err); }
+.mpau-info { color: var(--mpau-info); }
+.mpau-dim { color: var(--mpau-text-dim); }
+
+/* 滚动条 */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: rgba(148, 163, 184, 0.25); border-radius: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+
+/* 表格暗色微调 */
+.el-table { --el-table-header-bg-color: rgba(99, 102, 241, 0.06); --el-table-border-color: rgba(148, 163, 184, 0.1); }

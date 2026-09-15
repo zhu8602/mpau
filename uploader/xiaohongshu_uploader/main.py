@@ -206,6 +206,36 @@ async def xiaohongshu_setup(
     return result if return_detail else True
 
 
+async def _extract_xhs_nickname(page: Page) -> str:
+    """小红书创作者后台顶栏 .user-info .name-box 抓真实昵称; 抓不到返回空串。"""
+    try:
+        for sel in ("div.user-info div.name-box", "div.name-box", "div.user-info"):
+            loc = page.locator(sel).first
+            if not await loc.count() or not await loc.is_visible():
+                continue
+            text = (await loc.inner_text()).strip()
+            for line in text.splitlines():
+                line = line.strip()
+                if line and len(line) <= 24:
+                    return line
+            if text and len(text) <= 24:
+                return text
+    except Exception:
+        pass
+    return ""
+
+
+async def fetch_account_nickname(account_file) -> str:
+    """独立抓取小红书创作者后台真实昵称并写入账号元数据(供 `mpau xiaohongshu nickname` 与 Web 登录回填)。
+
+    与登录子进程解耦: 网页端「完成登录」会 taskkill 登录进程, 那里尾部的抓取可能来不及执行。
+    失败返回空串, 不影响登录状态。
+    """
+    from utils.nickname import capture_nickname
+
+    return await capture_nickname("xiaohongshu", str(account_file), "https://creator.xiaohongshu.com/", _extract_xhs_nickname)
+
+
 async def xiaohongshu_cookie_gen(
     account_file,
     qrcode_callback=None,
@@ -240,6 +270,17 @@ async def xiaohongshu_cookie_gen(
                     if await cookie_auth(account_file):
                         xiaohongshu_logger.success(_msg("🥳", "小红书扫码登录成功，小人开心收工"))
                         result = _build_login_result(True, "success", "小红书扫码登录成功", account_file, qrcode_info, page.url)
+                        # 抓取真实昵称用于账号列表展示(失败不影响登录结果)
+                        try:
+                            from pipeline.account_meta import set_nickname
+
+                            nickname = await _extract_xhs_nickname(page)
+                            if nickname:
+                                set_nickname("xiaohongshu", Path(account_file).stem, nickname)
+                                xiaohongshu_logger.info(_msg("👤", f"已记录平台昵称: {nickname}"))
+                                print(f"[PROFILE] platform=xiaohongshu account={Path(account_file).stem} nickname={nickname}", flush=True)
+                        except Exception:
+                            pass
                     else:
                         result = _build_login_result(
                             False,
