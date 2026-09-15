@@ -67,6 +67,16 @@ mpau 发布台是一个**开箱即用的多平台内容自动发布系统**：�
 
 ---
 
+## 核心实体与风控逻辑
+
+账号、素材、批次、条目（视频 × 平台 × 账号）、任务如何协同运转，以及系统默认开启的风控策略：
+
+<p align="center">
+  <img src="assets/entity-risk.jpg" alt="核心实体与风控逻辑" width="100%" />
+</p>
+
+---
+
 ## 快速开始
 
 ### 方式一：安装版（推荐，免环境）
@@ -97,6 +107,10 @@ uv run --extra web python web/app.py
 ---
 
 ## 七步发出第一条内容
+
+<p align="center">
+  <img src="assets/flow-pipeline.jpg" alt="端到端业务流程" width="100%" />
+</p>
 
 1. **启动后台**：安装版双击桌面图标（源码版运行 `web/app.py` 后打开带 token 的链接）
 2. **扫码登录**：选平台 → 输入账号昵称 → 手机 App 扫码确认，长期免登
@@ -144,6 +158,14 @@ mpau batch report --batch-id <id>
 详见 [Agent 集成文档](docs/agent-integration.md)。系统本身不含对话界面，Agent 能力以源码版提供。
 
 ---
+
+## 系统架构
+
+本地部署核心：启动器拉起 Web 服务，网页后台与 CLI 共用批量引擎，经 patchright 浏览器自动化分发到 10 个平台；数据全部留在本机。
+
+<p align="center">
+  <img src="assets/arch-overview.jpg" alt="系统总体架构" width="100%" />
+</p>
 
 ## 项目结构
 
